@@ -22,8 +22,6 @@ from utils import progress_bar
 from dataset import ImageDataset, VideoDataset, PicoDataset
 
 # Import models
-import resnet
-import resnext
 import densenet
 from models import FeatRNN, FullModel, Pass
 
