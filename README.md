@@ -16,3 +16,9 @@ Contains all CNN training, testing, and data partitioning scripts.
 
 ### pico
 Contains all code related to operating the pico monstar camera, including wrappers I wrote for running everything in Python3.
+
+### presentation
+Contains the slides and video presented for this project. The video has a demo of the real-time use case in the last 1m30s or so. 
+
+### paper
+Contains the final paper submitted with this project.
