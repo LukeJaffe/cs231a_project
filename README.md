@@ -1,6 +1,6 @@
 # CS231A Project
 This repo contains codes for a hand action recognition project.
-Author: Luke Jaffe <lukejaffe,github.io>
+Author: Luke Jaffe <lukejaffe.github.io>
 
 ## Directory Structure
 dev.sh starts the docker container and mounts all needed directories. SDK path should be changed to your SDK path.
