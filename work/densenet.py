@@ -1,114 +1,215 @@
-'''DenseNet in PyTorch.'''
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from collections import OrderedDict
+import math
 
-from torch.autograd import Variable
+__all__ = [
+    'DenseNet', 'densenet121', 'densenet169', 'densenet201', 'densenet264'
+]
 
 
-class Bottleneck(nn.Module):
-    def __init__(self, in_planes, growth_rate):
-        super(Bottleneck, self).__init__()
-        self.bn1 = nn.BatchNorm2d(in_planes)
-        self.conv1 = nn.Conv2d(in_planes, 4*growth_rate, kernel_size=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(4*growth_rate)
-        self.conv2 = nn.Conv2d(4*growth_rate, growth_rate, kernel_size=3, padding=1, bias=False)
+def densenet121(**kwargs):
+    model = DenseNet(
+        num_init_features=64,
+        growth_rate=32,
+        block_config=(6, 12, 24, 16),
+        **kwargs)
+    return model
+
+
+def densenet169(**kwargs):
+    model = DenseNet(
+        num_init_features=64,
+        growth_rate=32,
+        block_config=(6, 12, 32, 32),
+        **kwargs)
+    return model
+
+
+def densenet201(**kwargs):
+    model = DenseNet(
+        num_init_features=64,
+        growth_rate=32,
+        block_config=(6, 12, 48, 32),
+        **kwargs)
+    return model
+
+
+def densenet264(**kwargs):
+    model = DenseNet(
+        num_init_features=64,
+        growth_rate=32,
+        block_config=(6, 12, 64, 48),
+        **kwargs)
+    return model
+
+
+def get_fine_tuning_parameters(model, ft_begin_index):
+    if ft_begin_index == 0:
+        return model.parameters()
+
+    ft_module_names = []
+    for i in range(ft_begin_index, 5):
+        ft_module_names.append('denseblock{}'.format(i))
+        ft_module_names.append('transition{}'.format(i))
+    ft_module_names.append('norm5')
+    ft_module_names.append('classifier')
+
+    parameters = []
+    for k, v in model.named_parameters():
+        for ft_module in ft_module_names:
+            if ft_module in k:
+                parameters.append({'params': v})
+                break
+        else:
+            parameters.append({'params': v, 'lr': 0.0})
+
+    return parameters
+
+
+class _DenseLayer(nn.Sequential):
+
+    def __init__(self, num_input_features, growth_rate, bn_size, drop_rate):
+        super(_DenseLayer, self).__init__()
+        self.add_module('norm.1', nn.BatchNorm3d(num_input_features))
+        self.add_module('relu.1', nn.ReLU(inplace=True))
+        self.add_module('conv.1',
+                        nn.Conv3d(
+                            num_input_features,
+                            bn_size * growth_rate,
+                            kernel_size=1,
+                            stride=1,
+                            bias=False))
+        self.add_module('norm.2', nn.BatchNorm3d(bn_size * growth_rate))
+        self.add_module('relu.2', nn.ReLU(inplace=True))
+        self.add_module('conv.2',
+                        nn.Conv3d(
+                            bn_size * growth_rate,
+                            growth_rate,
+                            kernel_size=3,
+                            stride=1,
+                            padding=1,
+                            bias=False))
+        self.drop_rate = drop_rate
 
     def forward(self, x):
-        out = self.conv1(F.relu(self.bn1(x)))
-        out = self.conv2(F.relu(self.bn2(out)))
-        out = torch.cat([out,x], 1)
-        return out
+        new_features = super(_DenseLayer, self).forward(x)
+        if self.drop_rate > 0:
+            new_features = F.dropout(
+                new_features, p=self.drop_rate, training=self.training)
+        return torch.cat([x, new_features], 1)
 
 
-class Transition(nn.Module):
-    def __init__(self, in_planes, out_planes):
-        super(Transition, self).__init__()
-        self.bn = nn.BatchNorm2d(in_planes)
-        self.conv = nn.Conv2d(in_planes, out_planes, kernel_size=1, bias=False)
+class _DenseBlock(nn.Sequential):
 
-    def forward(self, x):
-        out = self.conv(F.relu(self.bn(x)))
-        out = F.avg_pool2d(out, 2)
-        return out
+    def __init__(self, num_layers, num_input_features, bn_size, growth_rate,
+                 drop_rate):
+        super(_DenseBlock, self).__init__()
+        for i in range(num_layers):
+            layer = _DenseLayer(num_input_features + i * growth_rate,
+                                growth_rate, bn_size, drop_rate)
+            self.add_module('denselayer%d' % (i + 1), layer)
+
+
+class _Transition(nn.Sequential):
+
+    def __init__(self, num_input_features, num_output_features):
+        super(_Transition, self).__init__()
+        self.add_module('norm', nn.BatchNorm3d(num_input_features))
+        self.add_module('relu', nn.ReLU(inplace=True))
+        self.add_module('conv',
+                        nn.Conv3d(
+                            num_input_features,
+                            num_output_features,
+                            kernel_size=1,
+                            stride=1,
+                            bias=False))
+        self.add_module('pool', nn.AvgPool3d(kernel_size=2, stride=2))
 
 
 class DenseNet(nn.Module):
-    def __init__(self, block, nblocks, growth_rate=12, reduction=0.5, num_classes=10):
+    """Densenet-BC model class
+    Args:
+        growth_rate (int) - how many filters to add each layer (k in paper)
+        block_config (list of 4 ints) - how many layers in each pooling block
+        num_init_features (int) - the number of filters to learn in the first convolution layer
+        bn_size (int) - multiplicative factor for number of bottle neck layers
+          (i.e. bn_size * k features in the bottleneck layer)
+        drop_rate (float) - dropout rate after each dense layer
+        num_classes (int) - number of classification classes
+    """
+
+    def __init__(self,
+                 sample_size,
+                 sample_duration,
+                 growth_rate=32,
+                 block_config=(6, 12, 24, 16),
+                 num_init_features=64,
+                 bn_size=4,
+                 drop_rate=0,
+                 num_classes=1000):
+
         super(DenseNet, self).__init__()
-        self.growth_rate = growth_rate
 
-        num_planes = 2*growth_rate
-        self.conv1 = nn.Conv2d(3, num_planes, kernel_size=3, padding=1, bias=False)
+        self.sample_size = sample_size
+        self.sample_duration = sample_duration
 
-        self.dense1 = self._make_dense_layers(block, num_planes, nblocks[0])
-        num_planes += nblocks[0]*growth_rate
-        out_planes = int(math.floor(num_planes*reduction))
-        self.trans1 = Transition(num_planes, out_planes)
-        num_planes = out_planes
+        # First convolution
+        self.features = nn.Sequential(
+            OrderedDict([
+                ('conv0',
+                 nn.Conv3d(
+                     2,
+                     num_init_features,
+                     kernel_size=7,
+                     stride=(1, 2, 2),
+                     padding=(3, 3, 3),
+                     bias=False)),
+                ('norm0', nn.BatchNorm3d(num_init_features)),
+                ('relu0', nn.ReLU(inplace=True)),
+                ('pool0', nn.MaxPool3d(kernel_size=3, stride=2, padding=1)),
+            ]))
 
-        self.dense2 = self._make_dense_layers(block, num_planes, nblocks[1])
-        num_planes += nblocks[1]*growth_rate
-        out_planes = int(math.floor(num_planes*reduction))
-        self.trans2 = Transition(num_planes, out_planes)
-        num_planes = out_planes
+        # Each denseblock
+        num_features = num_init_features
+        for i, num_layers in enumerate(block_config):
+            block = _DenseBlock(
+                num_layers=num_layers,
+                num_input_features=num_features,
+                bn_size=bn_size,
+                growth_rate=growth_rate,
+                drop_rate=drop_rate)
+            self.features.add_module('denseblock%d' % (i + 1), block)
+            num_features = num_features + num_layers * growth_rate
+            if i != len(block_config) - 1:
+                trans = _Transition(
+                    num_input_features=num_features,
+                    num_output_features=num_features // 2)
+                self.features.add_module('transition%d' % (i + 1), trans)
+                num_features = num_features // 2
 
-        self.dense3 = self._make_dense_layers(block, num_planes, nblocks[2])
-        num_planes += nblocks[2]*growth_rate
-        out_planes = int(math.floor(num_planes*reduction))
-        self.trans3 = Transition(num_planes, out_planes)
-        num_planes = out_planes
+        # Final batch norm
+        self.features.add_module('norm5', nn.BatchNorm3d(num_features))
 
-        self.dense4 = self._make_dense_layers(block, num_planes, nblocks[3])
-        num_planes += nblocks[3]*growth_rate
+        for m in self.modules():
+            if isinstance(m, nn.Conv3d):
+                m.weight = nn.init.kaiming_normal(m.weight, mode='fan_out')
+            elif isinstance(m, nn.BatchNorm3d) or isinstance(m, nn.BatchNorm3d):
+                m.weight.data.fill_(1)
+                m.bias.data.zero_()
 
-        self.bn = nn.BatchNorm2d(num_planes)
-        #self.linear = nn.Linear(num_planes, num_classes)
-        self.lstm = nn.LSTM(384, 10, 2, batch_first=True)
-
-    def _make_dense_layers(self, block, in_planes, nblock):
-        layers = []
-        for i in range(nblock):
-            layers.append(block(in_planes, self.growth_rate))
-            in_planes += self.growth_rate
-        return nn.Sequential(*layers)
+        # Linear layer
+        self.classifier = nn.Linear(num_features, num_classes)
 
     def forward(self, x):
-        out = self.conv1(x)
-        out = self.trans1(self.dense1(out))
-        out = self.trans2(self.dense2(out))
-        out = self.trans3(self.dense3(out))
-        out = self.dense4(out)
-        out = F.avg_pool2d(F.relu(self.bn(out)), 4)
-        out = out.view(out.size(0), -1).unsqueeze(0)
-        #out = self.linear(out)
-        out, _ = self.lstm(out)
-        return out[:, -1, :]
-
-def DenseNet121():
-    return DenseNet(Bottleneck, [6,12,24,16], growth_rate=32)
-
-def DenseNet169():
-    return DenseNet(Bottleneck, [6,12,32,32], growth_rate=32)
-
-def DenseNet201():
-    return DenseNet(Bottleneck, [6,12,48,32], growth_rate=32)
-
-def DenseNet161():
-    return DenseNet(Bottleneck, [6,12,36,24], growth_rate=48)
-
-def densenet_cifar():
-    return DenseNet(Bottleneck, [6,12,24,16], growth_rate=12)
-
-def DensenetHands():
-    return DenseNet(Bottleneck, [6,12,24,16], growth_rate=12)
-
-def test_densenet():
-    net = densenet_cifar()
-    x = torch.randn(1,3,32,32)
-    y = net(Variable(x))
-    print(y)
-
-# test_densenet()
+        x = x.transpose(1, 2)
+        features = self.features(x)
+        out = F.relu(features, inplace=True)
+        last_duration = int(math.ceil(self.sample_duration / 16))
+        last_size = int(math.floor(self.sample_size / 32))
+        out = F.avg_pool3d(
+            out, kernel_size=(last_duration, last_size, last_size)).view(
+                features.size(0), -1)
+        out = self.classifier(out)
+        return out

@@ -21,10 +21,16 @@ from dataset import FeatureDataset
 import collections
 from pprint import pprint
 
+from models import FeatRNN
+
 
 parser = argparse.ArgumentParser(description='PyTorch Training')
 parser.add_argument('--lr', default=1e-3, type=float, help='learning rate')
 parser.add_argument('--feature_dir', type=str, default='./features')
+parser.add_argument('--modality', type=str, default='fuse')
+parser.add_argument('--mode', type=str, choices=['train', 'test'], default='test')
+parser.add_argument('--model_path', type=str, default='./lstm/model.t7')
+parser.add_argument('--model_dir', type=str, default='./lstm')
 args = parser.parse_args()
 
 
@@ -34,34 +40,28 @@ start_epoch = 0  # start from epoch 0 or last checkpoint epoch
 
 # Data
 print('==> Preparing data..')
-normset = FeatureDataset(args.feature_dir, 'train', None, None)
+normset = FeatureDataset(args.feature_dir, args.modality, 'train', None, None)
 feat_mean, feat_std = normset.norm()
 
-trainset = FeatureDataset(args.feature_dir, 'train', feat_mean, feat_std)
+trainset = FeatureDataset(args.feature_dir, args.modality, 'train', feat_mean, feat_std)
 trainloader = torch.utils.data.DataLoader(trainset, batch_size=1, shuffle=True, num_workers=0)
 
-valset = FeatureDataset(args.feature_dir, 'val', feat_mean, feat_std)
+valset = FeatureDataset(args.feature_dir, args.modality, 'val', feat_mean, feat_std)
 valloader = torch.utils.data.DataLoader(valset, batch_size=1, shuffle=True, num_workers=0)
 
+#testset = FeatureDataset(args.feature_dir, args.modality, 'test', feat_mean, feat_std)
+#testloader = torch.utils.data.DataLoader(testset, batch_size=1, shuffle=True, num_workers=0)
 
-class RNN(torch.nn.Module):
-    def __init__(self):
-        super(RNN, self).__init__()
 
-        self.lstm = torch.nn.LSTM(2208, 128, 1)
-        self.classifier = torch.nn.Linear(128, 10)
-        self.act = torch.nn.Tanh()
-
-    def forward(self, x):
-        x, _ = self.lstm(x)
-        #x = x.squeeze()
-        x = x[:, -1, :]
-        #x = self.act(x)
-        x = self.classifier(x)
-        return x
-
-print('==> Building model..')
-net = RNN()
+if args.mode == 'train':
+    print('==> Building model..')
+    net = FeatRNN()
+elif args.mode == 'test':
+    checkpoint = torch.load(args.model_path)
+    net = checkpoint['net']
+    acc = checkpoint['acc']
+    epoch = checkpoint['epoch']
+    print('==> Loading model from epoch {}, acc={:.3f}'.format(epoch, acc))
 
 if use_cuda:
     net.cuda()
@@ -97,7 +97,7 @@ def train(epoch):
         progress_bar(batch_idx, len(trainloader), 'Loss: %.3f | Acc: %.3f%% (%d/%d)'
             % (train_loss/(batch_idx+1), 100.*correct/total, correct, total))
 
-def test(epoch):
+def test(epoch, dataloader, test=False):
     global best_acc
     net.eval()
     test_loss = 0
@@ -105,7 +105,7 @@ def test(epoch):
     total = 0
     conf_dict = collections.defaultdict(int)
     tot_dict = collections.defaultdict(int)
-    for batch_idx, (inputs, targets) in enumerate(valloader):
+    for batch_idx, (inputs, targets) in enumerate(dataloader):
         targets = targets.squeeze()
         if use_cuda:
             inputs, targets = inputs.cuda(), targets.cuda()
@@ -119,24 +119,27 @@ def test(epoch):
         #print(predicted.cpu().numpy()[0], targets.cpu().data.numpy()[0], '       ')
         correct += predicted.eq(targets.data).cpu().sum()
         conf_dict[targets.cpu().data.numpy()[0]] += predicted.eq(targets.data).cpu().sum()
-        tot_dict[targets.cpu().data.numpy()[0]] += 1
+        tot_dict[targets.cpu().data.numpy()[0]] += targets.size(0)
 
-        progress_bar(batch_idx, len(valloader), 'Loss: %.3f | Acc: %.3f%% (%d/%d)'
+        progress_bar(batch_idx, len(dataloader), 'Loss: %.3f | Acc: %.3f%% (%d/%d)'
             % (test_loss/(batch_idx+1), 100.*correct/total, correct, total))
 
     # Save checkpoint.
-    acc = 100.*correct/total
-    if acc > best_acc:
-        print('Saving..')
-        state = {
-            'net': net.module if use_cuda else net,
-            'acc': acc,
-            'epoch': epoch,
-        }
-        if not os.path.isdir('checkpoint'):
-            os.mkdir('checkpoint')
-        torch.save(state, './checkpoint/epoch{}.t7'.format(epoch))
-        best_acc = acc
+    if not test:
+        acc = 100.*correct/total
+        if acc > best_acc:
+            print('Saving..')
+            state = {
+                'net': net.module if use_cuda else net,
+                'mean': feat_mean,
+                'std': feat_std,
+                'acc': acc,
+                'epoch': epoch,
+            }
+            if not os.path.isdir(args.model_dir):
+                os.mkdir(args.model_dir)
+            torch.save(state, os.path.join(args.model_dir, 'model.t7'))
+            best_acc = acc
 
     print('Class breakdown:')
     for c in tot_dict:
@@ -144,6 +147,11 @@ def test(epoch):
 
 
 if __name__=='__main__':
-    for epoch in range(start_epoch, start_epoch+200):
-        train(epoch)
-        test(epoch)
+    if args.mode == 'train':
+        for epoch in range(start_epoch, start_epoch+10000):
+            train(epoch)
+            test(epoch, valloader)
+    elif args.mode == 'test':
+        test(epoch, trainloader, test=True)
+        test(epoch, valloader, test=True)
+        #test(epoch, testloader)
